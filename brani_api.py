@@ -18,11 +18,13 @@ BRANI_HESLO = os.getenv("BRANI_HESLO")
 ORDER_FEED_URL = os.getenv("ORDER_FEED_URL")
 COMAD_FEED_URL = os.getenv("COMAD_FEED_URL")
 ELTAP_FEED_URL = os.getenv("ELTAP_FEED_URL")
+FALCO_FEED_URL = os.getenv("FALCO_FEED_URL")
 
 # Soubor, kam si skript ukládá "paměť" o posledním spuštění
 STATE_FILE = os.path.join(BASE_DIR, "sync_state.json")
 COMAD_LOCAL_FILE = os.path.join(BASE_DIR, "feedy", "comad_feed.xml")
 ELTAP_LOCAL_FILE = os.path.join(BASE_DIR, "feedy", "eltap_feed.xml")
+FALCO_LOCAL_FILE = os.path.join(BASE_DIR, "feedy", "falco_feed.xml")
 
 # --- FUNKCE PRO PAMĚŤ A STAV (JSON) ---
 def nacti_stav():
@@ -44,7 +46,7 @@ def zajisti_dodavatelske_feedy(stav):
     posledni_stazeni = stav.get('last_supplier_update')
     
     # Podmínka: Stáhneme feedy, pokud dnes ještě nebyly staženy, NEBO pokud lokální soubory fyzicky chybí
-    potreba_stahnout = (posledni_stazeni != dnesni_datum) or not os.path.exists(COMAD_LOCAL_FILE) or not os.path.exists(ELTAP_LOCAL_FILE)
+    potreba_stahnout = (posledni_stazeni != dnesni_datum) or not os.path.exists(COMAD_LOCAL_FILE) or not os.path.exists(ELTAP_LOCAL_FILE) or not os.path.exists(FALCO_LOCAL_FILE)
     
     if potreba_stahnout:
         print(f"2. Stahuji aktuální dodavatelské feedy (Nové pro dnešní den: {dnesni_datum})...")
@@ -62,6 +64,13 @@ def zajisti_dodavatelske_feedy(stav):
         resp_eltap.raise_for_status()
         with open(ELTAP_LOCAL_FILE, 'wb') as f:
             f.write(resp_eltap.content)
+
+            # Stáhnout a uložit Falco
+        print("   -> Stahuji Falco...")
+        resp_falco = requests.get(FALCO_FEED_URL)
+        resp_falco.raise_for_status()
+        with open(FALCO_LOCAL_FILE, 'wb') as f:
+            f.write(resp_falco.content)
             
         # Aktualizovat datum v paměti
         stav['last_supplier_update'] = dnesni_datum
@@ -105,6 +114,21 @@ def zpracuj_eltap_feed():
     print(f"   -> [ELTAP] Načteno {len(baliky_mapa)} produktů.")
     return baliky_mapa
 
+def zpracuj_falco_feed():
+    tree = ET.parse(FALCO_LOCAL_FILE)
+    root = tree.getroot()
+    baliky_mapa = {}
+    
+    for product in root.findall('.//Product'):
+        ean = product.findtext('./Ean')
+        pocet = product.findtext('./Packages')
+        
+        if ean and pocet and pocet.isdigit():
+            baliky_mapa[ean] = int(pocet)
+            
+    print(f"   -> [FALCO] Načteno {len(baliky_mapa)} produktů.")
+    return baliky_mapa
+
 # --- FUNKCE PRO BRANI ---
 def ziskej_brani_token():
     print("1. Přihlašuji se do Brani...")
@@ -142,7 +166,7 @@ def aktualizuj_brani_poznamku(token, eshop_id, order_code, nova_poznamka):
     #     print(f"   ❌ Chyba ukládání ({order_code}): {response.text}")
 
 # --- HLAVNÍ LOGIKA PRO OBJEDNÁVKY ---
-def zpracuj_objednavky(token, mapa_comad, mapa_eltap, base_feed_url, stav):
+def zpracuj_objednavky(token, mapa_comad, mapa_eltap, mapa_falco, base_feed_url, stav):
     last_sync_str = stav.get('last_sync')
     
     if last_sync_str:
@@ -155,6 +179,7 @@ def zpracuj_objednavky(token, mapa_comad, mapa_eltap, base_feed_url, stav):
         print("\n3. První spuštění: Stahuji všechny dostupné objednávky z feedu...")
 
     last_sync_dt = datetime.strptime(last_sync_str, "%Y-%m-%d %H:%M:%S") if last_sync_str else None
+            
 
     # Ošetření XML
     response = requests.get(feed_url)
@@ -175,7 +200,7 @@ def zpracuj_objednavky(token, mapa_comad, mapa_eltap, base_feed_url, stav):
         order_date_str = order.findtext('DATE')
         
         # Ochrana proti přepisování už zapsaných balíků
-        if "🔴COMAD BALÍKY:" in shop_remark or "🔴ELTAP BALÍKY:" in shop_remark:
+        if "🔴COMAD BALÍKY:" in shop_remark or "🔴ELTAP BALÍKY:" in shop_remark or "🔴FALCO BALÍKY:" in shop_remark:
             preskoceno += 1
             continue
 
@@ -188,6 +213,7 @@ def zpracuj_objednavky(token, mapa_comad, mapa_eltap, base_feed_url, stav):
 
         comad_baliky = 0
         eltap_baliky = 0
+        falco_baliky = 0
         
         for item in order.findall('.//ITEM'):
             item_type = item.findtext('TYPE')
@@ -206,12 +232,16 @@ def zpracuj_objednavky(token, mapa_comad, mapa_eltap, base_feed_url, stav):
                 elif 'eltap' in manufacturer or 'eltap' in supplier:
                     if ean in mapa_eltap:
                         eltap_baliky += (mapa_eltap[ean] * mnozstvi)
+
+                elif 'falco' in manufacturer or 'falco' in supplier:
+                    if ean in mapa_falco:
+                        falco_baliky += (mapa_falco[ean] * mnozstvi)
         
         # Pokud v objednávce není nic od Comad ani Eltap, přeskočíme ji
-        if comad_baliky == 0 and eltap_baliky == 0:
+        if comad_baliky == 0 and eltap_baliky == 0 and falco_baliky == 0:
             continue
             
-        print(f"\nZpracovávám: {code} (Comad balíků: {comad_baliky}, Eltap balíků: {eltap_baliky})")
+        print(f"\nZpracovávám: {code} (Comad balíků: {comad_baliky}, Eltap balíků: {eltap_baliky}, Falco balíků: {falco_baliky})")
         zpracovano += 1
 
         eshop_id = 4256
@@ -227,8 +257,22 @@ def zpracuj_objednavky(token, mapa_comad, mapa_eltap, base_feed_url, stav):
             pridavek_k_poznamce += f"\n🔴COMAD BALÍKY: {comad_baliky}🔴"
         if eltap_baliky > 0:
             pridavek_k_poznamce += f"\n🔴ELTAP BALÍKY: {eltap_baliky}🔴"
+        if falco_baliky > 0:
+            pridavek_k_poznamce += f"\n🔴FALCO BALÍKY: {falco_baliky}🔴"
             
         vysledna_poznamka = f"{shop_remark.strip()}{pridavek_k_poznamce}"
+
+        if code == "202605348": 
+            print("\n" + "="*50)
+            print(f"🚀 TAKTO BY VYPADAJ VSTUP PRO BRANI U OBJ. {code}:")
+            print(f"   -> Cílový eshop_id: {eshop_id}")
+            print(f"   -> Cílový order_code: {order_code}")
+            print(f"   -> Text poznámky:\n{vysledna_poznamka}")
+            print("="*50 + "\n")
+            
+            # Nasimulujeme to přes funkci (vypíše JSON):
+            aktualizuj_brani_poznamku(token, eshop_id, order_code, vysledna_poznamka)
+            break
         
         aktualizuj_brani_poznamku(token, eshop_id, order_code, vysledna_poznamka)
 
@@ -260,9 +304,10 @@ if __name__ == "__main__":
                 # 2. Načte data z lokálních souborů (velmi rychlé)
                 mapa_comad = zpracuj_comad_feed()
                 mapa_eltap = zpracuj_eltap_feed()
+                mapa_falco = zpracuj_falco_feed()
                 
                 # 3. Zpracuje objednávky
-                zpracuj_objednavky(access_token, mapa_comad, mapa_eltap, ORDER_FEED_URL, stav)
+                zpracuj_objednavky(access_token, mapa_comad, mapa_eltap, mapa_falco, ORDER_FEED_URL, stav)
                 
                 # 4. Úspěšný konec - aktualizace času v JSONu
                 stav['last_sync'] = current_run_time
