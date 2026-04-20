@@ -19,12 +19,14 @@ ORDER_FEED_URL = os.getenv("ORDER_FEED_URL")
 COMAD_FEED_URL = os.getenv("COMAD_FEED_URL")
 ELTAP_FEED_URL = os.getenv("ELTAP_FEED_URL")
 ADRK_FEED_URL = os.getenv("ADRK_FEED_URL")
+INTERMEBLE_FEED_URL = os.getenv("INTERMEBLE_FEED_URL")
 
 # Soubor, kam si skript ukládá "paměť" o posledním spuštění
 STATE_FILE = os.path.join(BASE_DIR, "sync_state.json")
 COMAD_LOCAL_FILE = os.path.join(BASE_DIR, "feedy", "comad_feed.xml")
 ELTAP_LOCAL_FILE = os.path.join(BASE_DIR, "feedy", "eltap_feed.xml")
 ADRK_LOCAL_FILE = os.path.join(BASE_DIR, "feedy", "ADRK_feed.xml")
+INTERMEBLE_LOCAL_FILE = os.path.join(BASE_DIR, "feedy", "intermeble_feed.xml")
 
 # --- FUNKCE PRO PAMĚŤ A STAV (JSON) ---
 def nacti_stav():
@@ -46,7 +48,7 @@ def zajisti_dodavatelske_feedy(stav):
     posledni_stazeni = stav.get('last_supplier_update')
     
     # Podmínka: Stáhneme feedy, pokud dnes ještě nebyly staženy, NEBO pokud lokální soubory fyzicky chybí
-    potreba_stahnout = (posledni_stazeni != dnesni_datum) or not os.path.exists(COMAD_LOCAL_FILE) or not os.path.exists(ELTAP_LOCAL_FILE) or not os.path.exists(ADRK_LOCAL_FILE)
+    potreba_stahnout = (posledni_stazeni != dnesni_datum) or not os.path.exists(COMAD_LOCAL_FILE) or not os.path.exists(ELTAP_LOCAL_FILE) or not os.path.exists(ADRK_LOCAL_FILE) or not os.path.exists(INTERMEBLE_LOCAL_FILE)
     
     if potreba_stahnout:
         print(f"2. Stahuji aktuální dodavatelské feedy (Nové pro dnešní den: {dnesni_datum})...")
@@ -71,6 +73,13 @@ def zajisti_dodavatelske_feedy(stav):
         resp_adrk.raise_for_status()
         with open(ADRK_LOCAL_FILE, 'wb') as f:
             f.write(resp_adrk.content)
+
+                # Stáhnout a uložit adrk
+        print("   -> Stahuji Intermeble...")
+        resp_intermeble = requests.get(INTERMEBLE_FEED_URL)
+        resp_intermeble.raise_for_status()
+        with open(INTERMEBLE_LOCAL_FILE, 'wb') as f:
+            f.write(resp_intermeble.content)
             
         # Aktualizovat datum v paměti
         stav['last_supplier_update'] = dnesni_datum
@@ -129,6 +138,23 @@ def zpracuj_adrk_feed():
     print(f"   -> [ADRK] Načteno {len(baliky_mapa)} produktů.")
     return baliky_mapa
 
+
+def zpracuj_intermeble_feed():
+    tree = ET.parse(INTERMEBLE_LOCAL_FILE)
+    root = tree.getroot()
+    baliky_mapa = {}
+    
+    for product in root.findall('.//PRODUCT'):
+        ean = product.findtext('./EAN')
+        pocet = product.findtext('./PACKAGE-COUNT')
+        
+        if ean and pocet and pocet.isdigit():
+            baliky_mapa[ean] = int(pocet)
+            
+    print(f"   -> [Intermeble] Načteno {len(baliky_mapa)} produktů.")
+    return baliky_mapa
+
+
 # --- FUNKCE PRO BRANI ---
 def ziskej_brani_token():
     print("1. Přihlašuji se do Brani...")
@@ -166,7 +192,7 @@ def aktualizuj_brani_poznamku(token, eshop_id, order_code, nova_poznamka):
     #     print(f"   ❌ Chyba ukládání ({order_code}): {response.text}")
 
 # --- HLAVNÍ LOGIKA PRO OBJEDNÁVKY ---
-def zpracuj_objednavky(token, mapa_comad, mapa_eltap, mapa_adrk, base_feed_url, stav):
+def zpracuj_objednavky(token, mapa_comad, mapa_eltap, mapa_adrk, mapa_intermeble, base_feed_url, stav):
     last_sync_str = stav.get('last_sync')
     
     if last_sync_str:
@@ -196,31 +222,11 @@ def zpracuj_objednavky(token, mapa_comad, mapa_eltap, mapa_adrk, base_feed_url, 
 
     for order in root.findall('.//ORDER'):
         code = order.findtext('CODE')
-        # 🕵️‍♂️ ŠPIONÁŽNÍ BLOK PRO TESTOVACÍ OBJEDNÁVKU
-        if code == "202605348":
-            print(f"\n🚨 ŠPIÓN: Našel jsem objednávku {code}!")
-            shop_remark_test = order.findtext('SHOP_REMARK') or ""
-            date_test = order.findtext('DATE')
-            print(f"   -> Datum objednávky ve feedu: {date_test}")
-            print(f"   -> Čas poslední synchronizace (v JSONu): {last_sync_dt}")
-            
-            if "🔴" in shop_remark_test:
-                print("   ❌ ZAHODÍM JI: Už obsahuje naši poznámku s balíky.")
-            elif last_sync_dt and date_test:
-                test_dt = datetime.strptime(date_test, "%Y-%m-%d %H:%M:%S")
-                if test_dt <= last_sync_dt:
-                    print("   ❌ ZAHODÍM JI: Je starší než náš poslední záznam v paměti!")
-                else:
-                    print("   ✅ Prošla časovým filtrem, jdu počítat položky...")
-            else:
-                print("   ✅ Prošla časovým filtrem, jdu počítat položky...")
-        # ---------------------------------------------
-
         shop_remark = order.findtext('SHOP_REMARK') or ""
         order_date_str = order.findtext('DATE')
         
         # Ochrana proti přepisování už zapsaných balíků
-        if "🔴COMAD BALÍKY:" in shop_remark or "🔴ELTAP BALÍKY:" in shop_remark or "🔴ADRK BALÍKY:" in shop_remark:
+        if "🔴COMAD BALÍKY:" in shop_remark or "🔴ELTAP BALÍKY:" in shop_remark or "🔴ADRK BALÍKY:" in shop_remark or "🔴INTERMEBLE BALÍKY:" in shop_remark:
             preskoceno += 1
             continue
 
@@ -234,6 +240,7 @@ def zpracuj_objednavky(token, mapa_comad, mapa_eltap, mapa_adrk, base_feed_url, 
         comad_baliky = 0
         eltap_baliky = 0
         adrk_baliky = 0
+        intermeble_baliky = 0
         
         for item in order.findall('.//ITEM'):
             item_type = item.findtext('TYPE')
@@ -256,12 +263,16 @@ def zpracuj_objednavky(token, mapa_comad, mapa_eltap, mapa_adrk, base_feed_url, 
                 elif 'adrk' in manufacturer or 'adrk' in supplier:
                     if ean in mapa_adrk:
                         adrk_baliky += (mapa_adrk[ean] * mnozstvi)
+
+                elif 'intermeble' in manufacturer or 'intermeble' in supplier:
+                    if ean in mapa_intermeble:
+                        intermeble_baliky += (mapa_intermeble[ean] * mnozstvi)
         
         # Pokud v objednávce není nic od Comad ani Eltap, přeskočíme ji
-        if comad_baliky == 0 and eltap_baliky == 0 and adrk_baliky == 0:
+        if comad_baliky == 0 and eltap_baliky == 0 and adrk_baliky == 0 and intermeble_baliky == 0:
             continue
             
-        print(f"\nZpracovávám: {code} (Comad balíků: {comad_baliky}, Eltap balíků: {eltap_baliky}, ADRK balíků: {adrk_baliky})")
+        print(f"\nZpracovávám: {code} (Comad balíků: {comad_baliky}, Eltap balíků: {eltap_baliky}, ADRK balíků: {adrk_baliky}, INTERMEBLE balíků: {intermeble_baliky})")
         zpracovano += 1
 
         eshop_id = 4256
@@ -279,6 +290,8 @@ def zpracuj_objednavky(token, mapa_comad, mapa_eltap, mapa_adrk, base_feed_url, 
             pridavek_k_poznamce += f"\n🔴ELTAP BALÍKY: {eltap_baliky}🔴"
         if adrk_baliky > 0:
             pridavek_k_poznamce += f"\n🔴ADRK BALÍKY: {adrk_baliky}🔴"
+        if intermeble_baliky > 0:
+            pridavek_k_poznamce += f"\n🔴INTERMEBLE BALÍKY: {intermeble_baliky}🔴"
             
         vysledna_poznamka = f"{shop_remark.strip()}{pridavek_k_poznamce}"
         
@@ -313,9 +326,10 @@ if __name__ == "__main__":
                 mapa_comad = zpracuj_comad_feed()
                 mapa_eltap = zpracuj_eltap_feed()
                 mapa_adrk = zpracuj_adrk_feed()
+                mapa_intermeble = zpracuj_intermeble_feed()
                 
                 # 3. Zpracuje objednávky
-                zpracuj_objednavky(access_token, mapa_comad, mapa_eltap, mapa_adrk, ORDER_FEED_URL, stav)
+                zpracuj_objednavky(access_token, mapa_comad, mapa_eltap, mapa_adrk, mapa_intermeble, ORDER_FEED_URL, stav)
                 
                 # 4. Úspěšný konec - aktualizace času v JSONu
                 stav['last_sync'] = current_run_time
