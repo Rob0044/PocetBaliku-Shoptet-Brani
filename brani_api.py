@@ -16,32 +16,96 @@ BRANI_HESLO = os.getenv("BRANI_HESLO")
 
 # URL adresy pro tvé XML feedy (případně můžeš načítat z lokálního souboru)
 ORDER_FEED_URL = os.getenv("ORDER_FEED_URL")
-SUPPLIER_FEED_URL = os.getenv("SUPPLIER_FEED_URL")
+COMAD_FEED_URL = os.getenv("COMAD_FEED_URL")
+ELTAP_FEED_URL = os.getenv("ELTAP_FEED_URL")
 
 # Soubor, kam si skript ukládá "paměť" o posledním spuštění
 STATE_FILE = os.path.join(BASE_DIR, "sync_state.json")
+COMAD_LOCAL_FILE = os.path.join(BASE_DIR, "feedy", "comad_feed.xml")
+ELTAP_LOCAL_FILE = os.path.join(BASE_DIR, "feedy", "eltap_feed.xml")
 
-# --- FUNKCE PRO PAMĚŤ SKRIPTU ---
-def ziskej_posledni_synchronizaci():
+# --- FUNKCE PRO PAMĚŤ A STAV (JSON) ---
+def nacti_stav():
     if os.path.exists(STATE_FILE):
         try:
             with open(STATE_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return data.get('last_sync')
+                return json.load(f)
         except (json.JSONDecodeError, KeyError):
-            return None
-    return None
+            return {}
+    return {}
 
-def uloz_aktualni_synchronizaci(cas_str, status="success"):
-    data = {
-        'last_sync': cas_str,
-        'last_run_status': status,
-        'updated_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    }
+def uloz_stav(stav_dict):
     with open(STATE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+        json.dump(stav_dict, f, indent=4, ensure_ascii=False)
 
-# --- FUNKCE PRO BRANI A DODAVATELE ---
+# --- FUNKCE PRO STAHOVÁNÍ A ČTENÍ DODAVATELŮ (1x DENNĚ) ---
+def zajisti_dodavatelske_feedy(stav):
+    dnesni_datum = datetime.now().strftime("%Y-%m-%d")
+    posledni_stazeni = stav.get('last_supplier_update')
+    
+    # Podmínka: Stáhneme feedy, pokud dnes ještě nebyly staženy, NEBO pokud lokální soubory fyzicky chybí
+    potreba_stahnout = (posledni_stazeni != dnesni_datum) or not os.path.exists(COMAD_LOCAL_FILE) or not os.path.exists(ELTAP_LOCAL_FILE)
+    
+    if potreba_stahnout:
+        print(f"2. Stahuji aktuální dodavatelské feedy (Nové pro dnešní den: {dnesni_datum})...")
+        
+        # Stáhnout a uložit Comad
+        print("   -> Stahuji Comad...")
+        resp_comad = requests.get(COMAD_FEED_URL)
+        resp_comad.raise_for_status()
+        with open(COMAD_LOCAL_FILE, 'wb') as f:
+            f.write(resp_comad.content)
+            
+        # Stáhnout a uložit Eltap
+        print("   -> Stahuji Eltap...")
+        resp_eltap = requests.get(ELTAP_FEED_URL)
+        resp_eltap.raise_for_status()
+        with open(ELTAP_LOCAL_FILE, 'wb') as f:
+            f.write(resp_eltap.content)
+            
+        # Aktualizovat datum v paměti
+        stav['last_supplier_update'] = dnesni_datum
+        uloz_stav(stav)
+        print("   ✅ Feedy uloženy lokálně pro dnešní den.")
+    else:
+        print(f"2. Dodavatelské feedy už byly dnes ({dnesni_datum}) staženy. Načítám z lokálního disku...")
+
+def zpracuj_comad_feed():
+    # Načítáme z lokálního souboru, ne z internetu
+    tree = ET.parse(COMAD_LOCAL_FILE)
+    root = tree.getroot()
+    baliky_mapa = {}
+    
+    for article in root.findall('.//Article'):
+        ean = article.findtext('./EAN')
+        if not ean: continue
+            
+        for attr in article.findall('./Attributes/Attribute'):
+            if attr.findtext('./Code') == 'Ilość Paczek':
+                pocet = attr.findtext('./Value')
+                if pocet and pocet.isdigit():
+                    baliky_mapa[ean] = int(pocet)
+                break 
+                
+    print(f"   -> [COMAD] Načteno {len(baliky_mapa)} produktů.")
+    return baliky_mapa
+
+def zpracuj_eltap_feed():
+    tree = ET.parse(ELTAP_LOCAL_FILE)
+    root = tree.getroot()
+    baliky_mapa = {}
+    
+    for product in root.findall('.//Product'):
+        ean = product.findtext('./EAN')
+        pocet = product.findtext('./Ilosc_paczek')
+        
+        if ean and pocet and pocet.isdigit():
+            baliky_mapa[ean] = int(pocet)
+            
+    print(f"   -> [ELTAP] Načteno {len(baliky_mapa)} produktů.")
+    return baliky_mapa
+
+# --- FUNKCE PRO BRANI ---
 def ziskej_brani_token():
     print("1. Přihlašuji se do Brani...")
     response = requests.post(
@@ -53,29 +117,6 @@ def ziskej_brani_token():
     else:
         print(f"❌ Chyba přihlášení do Brani: {response.text}")
         return None
-
-def zpracuj_dodavatelsky_feed(url):
-    print("2. Stahuji a zpracovávám feed dodavatele Comad...")
-    response = requests.get(url)
-    response.raise_for_status() 
-    
-    root = ET.fromstring(response.content)
-    baliky_mapa = {}
-    
-    for article in root.findall('.//Article'):
-        ean = article.findtext('./EAN')
-        if not ean:
-            continue
-            
-        for attr in article.findall('./Attributes/Attribute'):
-            if attr.findtext('./Code') == 'Ilość Paczek':
-                pocet = attr.findtext('./Value')
-                if pocet and pocet.isdigit():
-                    baliky_mapa[ean] = int(pocet)
-                break 
-                
-    print(f"   -> Do paměti načteno {len(baliky_mapa)} produktů s počtem balíků.")
-    return baliky_mapa
 
 def aktualizuj_brani_poznamku(token, eshop_id, order_code, nova_poznamka):
     url = 'https://balic.brani.cz/api/packing/set_remark/'
@@ -90,26 +131,22 @@ def aktualizuj_brani_poznamku(token, eshop_id, order_code, nova_poznamka):
         "remark": nova_poznamka
     }
     
-    # --- DRY RUN (Simulace) ---
-    print(f"   🛠️ [SIMULACE] Cílová URL: {url}")
-    print(f"   🛠️ [SIMULACE] Odesílaná data (Payload):")
-    print(json.dumps(payload, indent=4, ensure_ascii=False))
+    # --- DRY RUN (Simulace) - Odkryj request.post až to budeš chtít na ostro ---
+    print(f"   🛠️ [SIMULACE] Payload pro Brani:\n{json.dumps(payload, indent=4, ensure_ascii=False)}")
     print("   -------------------------------------------------")
     
-    # ZDE ODSTRANÍŠ MŘÍŽKY, AŽ TO BUDEŠ CHTÍT POSÍLAT NA OSTRO:
     # response = requests.post(url, headers=headers, json=payload)
     # if response.status_code in [200, 201]:
-    #     print(f"   ✅ Poznámka uložena (Objednávka: {order_code}, E-shop: {eshop_id})")
+    #     print(f"   ✅ Uloženo (Obj: {order_code})")
     # else:
-    #     print(f"   ❌ Chyba ukládání ({order_code}): {response.status_code} - {response.text}")
+    #     print(f"   ❌ Chyba ukládání ({order_code}): {response.text}")
 
 # --- HLAVNÍ LOGIKA PRO OBJEDNÁVKY ---
-def zpracuj_objednavky(token, baliky_mapa, base_feed_url, last_sync_str):
-    # 1. Úprava URL adresy feedu na základě poslední synchronizace
+def zpracuj_objednavky(token, mapa_comad, mapa_eltap, base_feed_url, stav):
+    last_sync_str = stav.get('last_sync')
+    
     if last_sync_str:
-        # Nahradíme mezeru znakem %20 pro platnou URL adresu
         url_time = last_sync_str.replace(" ", "%20")
-        # Rozhodneme se, zda přidat ? nebo &, podle toho, jak vypadá základní URL
         separator = "&" if "?" in base_feed_url else "?"
         feed_url = f"{base_feed_url}{separator}updateTimeFrom={url_time}"
         print(f"\n3. Stahuji objednávky z: {feed_url}")
@@ -117,10 +154,9 @@ def zpracuj_objednavky(token, baliky_mapa, base_feed_url, last_sync_str):
         feed_url = base_feed_url
         print("\n3. První spuštění: Stahuji všechny dostupné objednávky z feedu...")
 
-    # Zpracování času poslední synchronizace do formátu datetime (pro porovnávání <DATE>)
     last_sync_dt = datetime.strptime(last_sync_str, "%Y-%m-%d %H:%M:%S") if last_sync_str else None
 
-    # Stažení a vyčištění XML
+    # Ošetření XML
     response = requests.get(feed_url)
     response.raise_for_status()
     xml_text = response.content.decode('utf-8-sig').strip()
@@ -138,89 +174,103 @@ def zpracuj_objednavky(token, baliky_mapa, base_feed_url, last_sync_str):
         shop_remark = order.findtext('SHOP_REMARK') or ""
         order_date_str = order.findtext('DATE')
         
-        # 💡 KONTROLA 1: Byly balíky už zapsány? (Ochrana proti duplicitám)
-        if "🔴POČET BALÍKŮ:" in shop_remark:
+        # Ochrana proti přepisování už zapsaných balíků
+        if "🔴COMAD BALÍKY:" in shop_remark or "🔴ELTAP BALÍKY:" in shop_remark:
             preskoceno += 1
             continue
 
-        # 💡 KONTROLA 2: Filtrace starých objednávek (pokud nám feed poslal aktualizovanou)
+        # Časová filtrace aktualizovaných (ale starých) objednávek
         if last_sync_dt and order_date_str:
             order_dt = datetime.strptime(order_date_str, "%Y-%m-%d %H:%M:%S")
             if order_dt <= last_sync_dt:
                 preskoceno += 1
                 continue
 
-        celkovy_pocet_baliku = 0
-        comad_nalezen = False
+        comad_baliky = 0
+        eltap_baliky = 0
         
         for item in order.findall('.//ITEM'):
             item_type = item.findtext('TYPE')
             if item_type == 'product':
                 manufacturer = (item.findtext('MANUFACTURER') or "").lower()
                 supplier = (item.findtext('SUPPLIER') or "").lower()
+                ean = item.findtext('EAN')
+                mnozstvi = int(float(item.findtext('AMOUNT') or 1))
                 
+                # Zpracování COMAD
                 if 'comad' in manufacturer or 'comad' in supplier:
-                    comad_nalezen = True
-                    ean = item.findtext('EAN')
-                    
-                    if ean in baliky_mapa:
-                        mnozstvi = int(float(item.findtext('AMOUNT') or 1))
-                        celkovy_pocet_baliku += (baliky_mapa[ean] * mnozstvi)
+                    if ean in mapa_comad:
+                        comad_baliky += (mapa_comad[ean] * mnozstvi)
+                        
+                # Zpracování ELTAP
+                elif 'eltap' in manufacturer or 'eltap' in supplier:
+                    if ean in mapa_eltap:
+                        eltap_baliky += (mapa_eltap[ean] * mnozstvi)
         
-        if not comad_nalezen:
+        # Pokud v objednávce není nic od Comad ani Eltap, přeskočíme ji
+        if comad_baliky == 0 and eltap_baliky == 0:
             continue
             
-        print(f"\nZpracovávám novou objednávku: {code} (Datum: {order_date_str}, Balíků: {celkovy_pocet_baliku})")
+        print(f"\nZpracovávám: {code} (Comad balíků: {comad_baliky}, Eltap balíků: {eltap_baliky})")
         zpracovano += 1
 
         eshop_id = 4256
         order_code = code
         base_match = re.search(r"Base\.com Order ID:\s*(\d+)", shop_remark)
-        
         if base_match:
             order_code = base_match.group(1)
             eshop_id = 6038
             
-        shop_remark = shop_remark.strip()
-        vysledna_poznamka = f"{shop_remark}\n🔴POČET BALÍKŮ: {celkovy_pocet_baliku}🔴"
+        # Sestavení nové poznámky s podmínkami
+        pridavek_k_poznamce = ""
+        if comad_baliky > 0:
+            pridavek_k_poznamce += f"\n🔴COMAD BALÍKY: {comad_baliky}🔴"
+        if eltap_baliky > 0:
+            pridavek_k_poznamce += f"\n🔴ELTAP BALÍKY: {eltap_baliky}🔴"
+            
+        vysledna_poznamka = f"{shop_remark.strip()}{pridavek_k_poznamce}"
         
         aktualizuj_brani_poznamku(token, eshop_id, order_code, vysledna_poznamka)
 
-    print(f"\nShrnutí: {zpracovano} objednávek zpracováno, {preskoceno} přeskočeno (staré nebo již obsahují poznámku).")
+    print(f"\nShrnutí: {zpracovano} objednávek odesláno, {preskoceno} přeskočeno.")
 
-# --- HLAVNÍ SPUŠTĚNÍ SKRIPTU ---
+# --- HLAVNÍ SPUŠTĚNÍ ---
 if __name__ == "__main__":
-    # 1. Zaznamenáme aktuální čas pro příští synchronizaci
     current_run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stav = nacti_stav()
     
-    # 2. Zjistíme, zda už máme nějakou historii
-    last_sync = ziskej_posledni_synchronizaci()
-    
-    if last_sync is None:
-        # --- SCÉNÁŘ: PRVNÍ SPUŠTĚNÍ (INICIALIZACE) ---
+    # Scénář A: První spuštění (jen inicializace)
+    if 'last_sync' not in stav:
         print("--- PRVNÍ SPUŠTĚNÍ: Inicializace systému ---")
-        uloz_aktualni_synchronizaci(current_run_time, status="initialized")
-        print(f"✅ Čas {current_run_time} byl uložen jako výchozí bod.")
-        print("💡 Žádné objednávky nebyly staženy ani zpracovány. Skript končí.")
-        # Skript zde skončí a nebude pokračovat k přihlašování a feedům
+        stav['last_sync'] = current_run_time
+        stav['last_run_status'] = 'initialized'
+        uloz_stav(stav)
+        print(f"✅ Čas {current_run_time} byl uložen. Skript končí bez zpracování objednávek.")
+    
+    # Scénář B: Běžná synchronizace
     else:
-        # --- SCÉNÁŘ: BĚŽNÁ SYNCHRONIZACE ---
-        print(f"--- Skript spuštěn. Zpracovávám nové změny od: {last_sync} ---")
+        print(f"--- Skript spuštěn. Zpracovávám nové změny od: {stav['last_sync']} ---")
         
         access_token = ziskej_brani_token()
-        
         if access_token:
             try:
-                # Načtení dat od dodavatele
-                mapa_baliku = zpracuj_dodavatelsky_feed(SUPPLIER_FEED_URL)
+                # 1. Zkontroluje, stáhne (pokud je potřeba) a uloží feedy
+                zajisti_dodavatelske_feedy(stav)
                 
-                # Zpracování objednávek (včetně parametru updateTimeFrom a kontroly <DATE>)
-                zpracuj_objednavky(access_token, mapa_baliku, ORDER_FEED_URL, last_sync)
+                # 2. Načte data z lokálních souborů (velmi rychlé)
+                mapa_comad = zpracuj_comad_feed()
+                mapa_eltap = zpracuj_eltap_feed()
                 
-                # Pokud vše proběhlo v pořádku, uložíme čas tohoto spuštění pro příště
-                uloz_aktualni_synchronizaci(current_run_time, status="success")
-                print(f"\n🎉 Synchronizace hotova. Příště budeme pokračovat od: {current_run_time}")
+                # 3. Zpracuje objednávky
+                zpracuj_objednavky(access_token, mapa_comad, mapa_eltap, ORDER_FEED_URL, stav)
+                
+                # 4. Úspěšný konec - aktualizace času v JSONu
+                stav['last_sync'] = current_run_time
+                stav['last_run_status'] = 'success'
+                stav['updated_at'] = current_run_time
+                uloz_stav(stav)
+                print(f"\n🎉 Vše hotovo. Příště budeme pokračovat od: {current_run_time}")
                 
             except Exception as e:
                 print(f"❌ Došlo k nečekané chybě: {e}")
-                print("⚠️ Čas synchronizace NEBYL aktualizován, aby nedošlo ke ztrátě dat.")
+                print("⚠️ Čas synchronizace objednávek NEBYL posunut, zkusíme to příště znovu.")
