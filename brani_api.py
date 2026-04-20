@@ -26,6 +26,7 @@ KONDELA_FEED_URL = os.getenv("KONDELA_FEED_URL")
 
 # Soubor, kam si skript ukládá "paměť" o posledním spuštění
 STATE_FILE = os.path.join(BASE_DIR, "sync_state.json")
+LOG_FILE = os.path.join(BASE_DIR, "log_file.jsonl")
 COMAD_LOCAL_FILE = os.path.join(BASE_DIR, "feedy", "comad_feed.xml")
 ELTAP_LOCAL_FILE = os.path.join(BASE_DIR, "feedy", "eltap_feed.xml")
 ADRK_LOCAL_FILE = os.path.join(BASE_DIR, "feedy", "ADRK_feed.xml")
@@ -98,6 +99,23 @@ def zajisti_dodavatelske_feedy(stav):
         print("   ✅ Feedy uloženy lokálně pro dnešní den.")
     else:
         print(f"2. Dodavatelské feedy už byly dnes ({dnesni_datum}) staženy. Načítám z lokálního disku...")
+
+def zapis_log_operace(order_code, eshop_id, nova_poznamka, status, detail=""):
+    """Zapíše výsledek operace jako jeden JSON řádek do souboru log_baliku.jsonl"""
+    
+    zaznam = {
+        "cas": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "objednavka": order_code,
+        "eshop": eshop_id,
+        "status": status,          # např. "SUCCESS" nebo "ERROR"
+        "poznamka": nova_poznamka, # Co se přesně posílalo
+        "detail": detail           # Pro chybové hlášky ze serveru
+    }
+    
+    # Parametr 'a' znamená Append (připsat na konec souboru)
+    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+        # Převedeme slovník na JSON text a přidáme odřádkování (\n)
+        f.write(json.dumps(zaznam, ensure_ascii=False) + '\n')
 
 def zpracuj_comad_feed():
     # Načítáme z lokálního souboru, ne z internetu
@@ -216,14 +234,18 @@ def aktualizuj_brani_poznamku(token, eshop_id, order_code, nova_poznamka):
     }
     
     # --- DRY RUN (Simulace) - Odkryj request.post až to budeš chtít na ostro ---
-    print(f"   🛠️ [SIMULACE] Payload pro Brani:\n{json.dumps(payload, indent=4, ensure_ascii=False)}")
+    print(f"   🛠️ Payload pro Brani:\n{json.dumps(payload, indent=4, ensure_ascii=False)}")
     print("   -------------------------------------------------")
     
     response = requests.post(url, headers=headers, json=payload)
     if response.status_code in [200, 201]:
         print(f"   ✅ Uloženo (Obj: {order_code})")
+        # ZDE PŘIDÁME ZÁPIS DO LOGU (Úspěch):
+        zapis_log_operace(order_code, eshop_id, nova_poznamka, "SUCCESS")
     else:
         print(f"   ❌ Chyba ukládání ({order_code}): {response.text}")
+        # ZDE PŘIDÁME ZÁPIS DO LOGU (Chyba):
+        zapis_log_operace(order_code, eshop_id, nova_poznamka, "ERROR", response.text)
 
 # --- HLAVNÍ LOGIKA PRO OBJEDNÁVKY ---
 def zpracuj_objednavky(token, mapa_comad, mapa_eltap, mapa_adrk, mapa_intermeble, mapa_kondela, base_feed_url, stav):
